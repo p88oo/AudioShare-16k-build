@@ -1,0 +1,148 @@
+name: Build AudioShare 16KB APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install build-tools, platform 36 and NDK r28
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install "platform-tools" "build-tools;36.0.0" "platforms;android-36" "ndk;28.2.13676358"
+
+      - name: Checkout AudioShare source (p88oo)
+        uses: actions/checkout@v4
+        with:
+          repository: p88oo/AudioShare
+          path: audioshare
+
+      - name: Checkout flac extension module (HeHang0)
+        uses: actions/checkout@v4
+        with:
+          repository: HeHang0/exoplayer-extension-flac
+          path: flac-ext
+
+      - name: Fetch media3 (1.3.1) decoder_flac jni sources
+        run: |
+          git clone --depth 1 --branch 1.3.1 --filter=blob:none --sparse \
+            https://github.com/androidx/media.git media3
+          cd media3
+          git sparse-checkout set libraries/decoder_flac/src/main/jni
+          ls libraries/decoder_flac/src/main/jni
+
+      - name: Download libFLAC 1.3.2
+        run: |
+          curl -fsSL -o flac.zip https://github.com/xiph/flac/archive/refs/tags/1.3.2.zip
+          unzip -q flac.zip   # -> flac-1.3.2/
+
+      - name: Build 16KB-aligned libflacJNI.so with NDK r28
+        run: |
+          set -e
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          mkdir -p flacbuild/jni
+          cp -r media3/libraries/decoder_flac/src/main/jni/. flacbuild/jni/
+          mkdir -p flacbuild/jni/flac/src
+          cp -r flac-1.3.2/include flacbuild/jni/flac/include
+          cp -r flac-1.3.2/src/libFLAC flacbuild/jni/flac/src/libFLAC
+          cd flacbuild
+          "$ANDROID_NDK_HOME/ndk-build" NDK_PROJECT_PATH="$PWD" \
+            APP_ABI="arm64-v8a armeabi-v7a" APP_PLATFORM=android-21 -j2
+          echo "--- LOAD alignment check ---"
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$LLVM_BIN/llvm-objdump" -p libs/arm64-v8a/libflacJNI.so | grep LOAD
+
+      - name: Assemble :flac module and patch AudioShare build files
+        run: |
+          set -e
+          cp -r flac-ext/exoplayer-extension-flac audioshare/android/flac
+          cp flacbuild/libs/arm64-v8a/libflacJNI.so audioshare/android/flac/libs/arm64-v8a/libflacJNI.so
+          cp flacbuild/libs/armeabi-v7a/libflacJNI.so audioshare/android/flac/libs/armeabi-v7a/libflacJNI.so
+          sed -i "s/version '8.5.0'/version '8.5.1'/g" audioshare/android/build.gradle
+          sed -i "s/include ':app'/include ':app'\ninclude ':flac'/" audioshare/android/settings.gradle
+          sed -i "s#com.github.HeHang0:exoplayer-extension-flac:1.3.1#project(':flac')#" \
+            audioshare/android/app/build.gradle
+          cat > audioshare/android/flac/build.gradle <<'EOF'
+plugins {
+    id 'com.android.library'
+}
+
+group = 'com.github.hehang0'
+
+android {
+    namespace 'androidx.media3.decoder.flac'
+    compileSdk 36
+
+    defaultConfig {
+        minSdk 16
+        multiDexEnabled true
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['libs']
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            multiDexEnabled true
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation 'androidx.media3:media3-exoplayer:1.3.1'
+    implementation 'androidx.annotation:annotation:1.7.1'
+    compileOnly 'org.checkerframework:checker-qual:3.37.0'
+}
+EOF
+
+      - name: Build release APK
+        run: |
+          cd audioshare/android
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon
+
+      - name: Verify ELF 16 KB alignment (official step)
+        run: |
+          set -e
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+          APK=audioshare/android/app/build/outputs/apk/release/app-release.apk
+          rm -rf apk_out && mkdir apk_out
+          unzip -q "$APK" -d apk_out
+          LLVM_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "== LOAD segments of arm64-v8a/libflacJNI.so =="
+          "$LLVM_BIN/llvm-objdump" -p apk_out/lib/arm64-v8a/libflacJNI.so | grep LOAD
+
+      - name: Verify ZIP 16 KB alignment (zipalign, official step)
+        run: |
+          APK=audioshare/android/app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME/build-tools/36.0.0/zipalign" -v -c -P 16 4 "$APK"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-16kb
+          path: audioshare/android/app/build/outputs/apk/release/app-release.apk
